@@ -1,0 +1,201 @@
+name: Crosspoint X4 Pro insider build
+
+# Upstream (crosspoint-reader/crosspoint-reader) develop dalını X4 Pro için derler
+# ve bu reponun "insider" release'ine koyar. Cihaza OTOMATİK FLASH YAPMAZ.
+
+on:
+  schedule:
+    - cron: "0 16 * * *"   # 16:00 UTC = 19:00 Türkiye saati
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Belirli commit/dal (boş = develop'un son hali). Test için: 490813f"
+        required: false
+        default: ""
+      force:
+        description: "Yeni commit olmasa da derle"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: insider-build
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: crosspoint-reader/crosspoint-reader
+  BRANCH: develop
+  PIO_ENV: x4pro-gh_release
+  RELEASE_TAG: insider
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Hedef commit'i belirle
+        id: up
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          if [ -n "$INPUT_REF" ]; then
+            target="$INPUT_REF"
+          else
+            target=$(git ls-remote "https://github.com/${UPSTREAM}.git" "refs/heads/${BRANCH}" | cut -f1)
+          fi
+          [ -n "$target" ] || { echo "Commit bulunamadı"; exit 1; }
+          echo "ref=$target" >> "$GITHUB_OUTPUT"
+
+      - name: Önceki derlenen commit
+        id: prev
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          body=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json body -q .body 2>/dev/null || true)
+          prev=$(echo "$body" | grep -oE 'commit:[0-9a-f]{40}' | head -1 | cut -d: -f2 || true)
+          echo "sha=$prev" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ steps.up.outputs.ref }}
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Karar
+        id: decide
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_FORCE: ${{ inputs.force }}
+          PREV_SHA: ${{ steps.prev.outputs.sha }}
+        run: |
+          full=$(git rev-parse HEAD)
+          echo "full=$full" >> "$GITHUB_OUTPUT"
+          echo "short=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+          if [ "$INPUT_FORCE" = "true" ] || [ -n "$INPUT_REF" ] || [ "$full" != "$PREV_SHA" ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "Yeni commit yok, atlanıyor."
+          fi
+
+      - uses: actions/setup-python@v6
+        if: steps.decide.outputs.build == 'true'
+        with:
+          python-version: "3.13"
+
+      - name: Install uv
+        if: steps.decide.outputs.build == 'true'
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "latest"
+          enable-cache: false
+
+      # Aşağıdaki kurulum adımları upstream'in kendi ci.yml dosyasından birebir alındı.
+      - name: Install PlatformIO Core
+        if: steps.decide.outputs.build == 'true'
+        run: |
+          uv pip install --system -U https://github.com/pioarduino/platformio-core/archive/refs/tags/v6.1.19.zip
+          uv pip install --system -U "littlefs-python>=0.16.0" "fatfs-ng>=0.1.14" "pyyaml>=6.0.2" \
+            "rich-click>=1.8.6" "zopfli>=0.2.2" "intelhex>=2.3.0" "rich>=14.0.0" "urllib3<2" \
+            "cryptography>=45.0.3" "certifi>=2025.8.3" "ecdsa>=0.19.1" "bitstring>=4.3.1" \
+            "reedsolo>=1.5.3,<1.8" "esp-idf-size>=2.0.0" "esp-coredump>=1.14.0"
+
+      - name: Cache PlatformIO packages
+        if: steps.decide.outputs.build == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-v3-${{ runner.os }}-${{ env.PIO_ENV }}-${{ hashFiles('platformio.ini', 'scripts/patch_pioarduino_cache.py') }}
+          restore-keys: pio-v3-${{ runner.os }}-${{ env.PIO_ENV }}-
+
+      - name: Pin pioarduino core inside the platform penv
+        if: steps.decide.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          pio pkg install -e "$PIO_ENV"
+          uv pip install --python ~/.platformio/penv/bin/python "pioarduino==6.1.19"
+          ~/.platformio/penv/bin/pio --version
+
+      # Sürüm yazısını resmi insider ile aynı yap: 2.0.0 -> 2.0.0-dev+<commit>
+      - name: Sürüm yaz
+        if: steps.decide.outputs.build == 'true'
+        env:
+          SHORT: ${{ steps.decide.outputs.short }}
+        run: |
+          base=$(grep -m1 -E '^version *= *' platformio.ini | sed -E 's/^version *= *//; s/[[:space:]]+$//')
+          [ -n "$base" ] || { echo "Sürüm bulunamadı"; exit 1; }
+          sed -i -E "0,/^version *= *.*/s//version = ${base}-dev+${SHORT}/" platformio.ini
+          grep -m1 -E '^version *= *' platformio.ini
+
+      - name: Derle
+        if: steps.decide.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          pio run -e "$PIO_ENV"
+
+      - name: Doğrula (hatalıysa yayınlama)
+        if: steps.decide.outputs.build == 'true'
+        env:
+          SHORT: ${{ steps.decide.outputs.short }}
+        run: |
+          python3 -I - <<'PY'
+          import os, struct, sys
+          p = f".pio/build/{os.environ['PIO_ENV']}/firmware.bin"
+          d = open(p, "rb").read()
+          short = os.environ["SHORT"]
+          ok = True
+          def chk(c, m):
+              global ok
+              print(("OK   " if c else "HATA ") + m)
+              ok = ok and c
+          chk(d[0] == 0xE9, "ESP görüntü başlığı (0xE9)")
+          chk(struct.unpack("<H", d[12:14])[0] == 0x09, "çip ESP32-S3 (X4 Pro)")
+          chk(3_000_000 < len(d) < 8_000_000, f"boyut makul ({len(d)} bayt)")
+          chk(f"-dev+{short}".encode() in d, f"sürüm yazısı -dev+{short}")
+          chk(b"x4pro" in d, "x4pro imzası")
+          sys.exit(0 if ok else 1)
+          PY
+
+      - name: Çıktıyı hazırla
+        if: steps.decide.outputs.build == 'true'
+        env:
+          SHORT: ${{ steps.decide.outputs.short }}
+        run: |
+          mkdir out
+          cp ".pio/build/${PIO_ENV}/firmware.bin" out/firmware.bin
+          cp out/firmware.bin "out/x4pro-insider-${SHORT}.bin"
+          sha256sum out/firmware.bin | cut -d' ' -f1 > out/sha256.txt
+          git log -15 --pretty='- %h %s' > out/changelog.txt
+
+      - name: Release'i güncelle
+        if: steps.decide.outputs.build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHORT: ${{ steps.decide.outputs.short }}
+          FULL: ${{ steps.decide.outputs.full }}
+        run: |
+          set -euo pipefail
+          {
+            echo "X4 Pro insider, upstream ${BRANCH} commit:${FULL}"
+            echo "sha256: $(cat out/sha256.txt)"
+            echo
+            echo "Son değişiklikler:"
+            cat out/changelog.txt
+          } > notes.md
+          title="X4 Pro insider $(date -u +%F) (${SHORT})"
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" out/firmware.bin "out/x4pro-insider-${SHORT}.bin" \
+              --repo "$GITHUB_REPOSITORY" --clobber
+            gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' \
+              | { grep '^x4pro-insider-' || true; } | { grep -v -- "-${SHORT}.bin" || true; } \
+              | while read -r a; do
+                  gh release delete-asset "$RELEASE_TAG" "$a" --repo "$GITHUB_REPOSITORY" -y
+                done
+            gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --title "$title" --notes-file notes.md --prerelease
+          else
+            gh release create "$RELEASE_TAG" out/firmware.bin "out/x4pro-insider-${SHORT}.bin" \
+              --repo "$GITHUB_REPOSITORY" --title "$title" --notes-file notes.md --prerelease
+          fi
