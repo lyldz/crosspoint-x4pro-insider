@@ -5,7 +5,8 @@ name: Crosspoint X4 Pro insider build
 
 on:
   schedule:
-    - cron: "0 16 * * *"   # 16:00 UTC = 19:00 Türkiye saati
+    - cron: "7 16 * * *"   # 19:07 TR (tam saatte GitHub sık geciktiriyor/atlıyor)
+    - cron: "7 18 * * *"   # 21:07 TR yedek; yeni commit yoksa derlemez
   workflow_dispatch:
     inputs:
       ref:
